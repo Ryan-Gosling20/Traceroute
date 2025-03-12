@@ -1,1 +1,190 @@
+using System;
+using System.Diagnostics;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
 
+class NetworkTrace
+{
+    static void Main()
+    {
+        while (true)
+        {  // Бесконечный цикл для ввода команд
+            Console.Write("Введите команду для трассировки: ");
+            string userInput = Console.ReadLine();  // Считываем введенную команду
+
+            if (string.IsNullOrWhiteSpace(userInput)) continue;  // Если строка пустая — пропускаем итерацию
+
+            // Разбиваем строку на части (разделитель — пробел), удаляем лишние пробелы
+            string[] commandParts = userInput.Split(new char[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+
+            // Проверяем, что команда состоит из 2 частей и начинается с "tracert"
+            if (commandParts.Length != 2 || commandParts[0].ToLower() != "tracert")
+            {
+                Console.WriteLine("Ошибка: используйте команду в формате tracert <IP>\n");
+                continue;
+            }
+
+            string destination = commandParts[1];  // Вторая часть — это IP-адрес или доменное имя
+            PerformTrace(destination);  // Запускаем трассировку
+
+            Console.WriteLine("\nТрассировка успешно завершена.\n");
+        }
+    }
+
+    static void PerformTrace(string destination)
+    {
+        IPAddress targetIP;  // Переменная для хранения целевого IP-адреса
+        string resolvedName = destination;  // По умолчанию используем введенное значение
+
+        try
+        {
+            // Преобразуем имя хоста в IP-адрес (если ввели имя, например "google.com")
+            IPAddress[] ipAddresses = Dns.GetHostAddresses(destination);
+            targetIP = ipAddresses.FirstOrDefault(ip => ip.AddressFamily == AddressFamily.InterNetwork) ?? ipAddresses.First();
+
+            // Пытаемся получить имя хоста по IP (обратное разрешение)
+            string reverseLookup = ResolveHostName(targetIP);
+            if (reverseLookup != "Неизвестный хост" && reverseLookup != destination)
+            {
+                resolvedName = reverseLookup;  // Если нашли имя хоста, используем его
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при разрешении хоста: {ex.Message}");
+            return;
+        }
+
+        // Выводим заголовок трассировки
+        Console.WriteLine($"\nТрассировка маршрута к {resolvedName} [{targetIP}]");
+        Console.WriteLine("с максимальным числом прыжков 30:\n");
+
+        using (Socket traceSocket = new Socket(AddressFamily.InterNetwork, SocketType.Raw, ProtocolType.Icmp))
+        {
+            traceSocket.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReceiveTimeout, 3000);  // Таймаут на получение ответа 3 сек
+
+            int packetCounter = 1; // Начальное значение счетчика пакетов
+
+            for (int currentTTL = 1; currentTTL <= 30; currentTTL++)
+            {  // Цикл с TTL от 1 до 30 (макс. число прыжков)
+                traceSocket.SetSocketOption(SocketOptionLevel.IP, SocketOptionName.IpTimeToLive, currentTTL);  // Устанавливаем TTL
+                EndPoint responseEndpoint = new IPEndPoint(IPAddress.Any, 0);  // Адрес для получения ответа
+
+                long[] responseTimes = new long[3];  // Массив для хранения трех измерений времени
+                IPAddress hopIP = null;  // IP-адрес текущего узла
+
+                for (int i = 0; i < 3; i++)
+                {  // Отправляем по 3 запроса на каждом узле
+                    byte[] icmpData = GenerateIcmpPacket((ushort)packetCounter);  // Передаем увеличивающийся счетчик пакетов
+                    packetCounter++; // Увеличиваем счетчик после каждой отправки
+
+                    Stopwatch timer = new Stopwatch();  // Засекаем время
+                    try
+                    {
+                        traceSocket.SendTo(icmpData, new IPEndPoint(targetIP, 0));  // Отправляем ICMP-запрос
+                        timer.Start();
+
+                        byte[] buffer = new byte[1024];
+                        int bytesReceived = traceSocket.ReceiveFrom(buffer, ref responseEndpoint);  // Ждем ответ
+                        timer.Stop();
+
+                        responseTimes[i] = timer.ElapsedMilliseconds;  // Записываем время ответа
+                        hopIP = ((IPEndPoint)responseEndpoint).Address;  // Получаем IP-адрес узла
+                    }
+                    catch (SocketException)
+                    {
+                        responseTimes[i] = -1;  // Если таймаут, записываем -1
+                    }
+                    Thread.Sleep(100);  // Задержка перед следующим запросом
+                }
+
+                DisplayTraceInfo(currentTTL, responseTimes, hopIP);  // Выводим результаты
+
+                if (hopIP != null && hopIP.Equals(targetIP))  // Если дошли до цели — выходим
+                    break;
+            }
+        }
+    }
+
+    static void DisplayTraceInfo(int ttl, long[] times, IPAddress hopIP)
+    {
+        string time1 = times[0] >= 0 ? $"{times[0]} мс" : "*";
+        string time2 = times[1] >= 0 ? $"{times[1]} мс" : "*";
+        string time3 = times[2] >= 0 ? $"{times[2]} мс" : "*";
+
+        if (hopIP == null)
+        {  // Если узел не ответил
+            Console.WriteLine($"{ttl,3}   {time1,5}   {time2,5}   {time3,5}   Превышен интервал ожидания для запроса.");
+        }
+        else
+        {
+            string hostName = ResolveHostName(hopIP);  // Получаем имя хоста
+            if (hostName == null || hostName == hopIP.ToString())
+            {
+                Console.WriteLine($"{ttl,3}   {time1,5}   {time2,5}   {time3,5}   {hopIP}");  // Выводим только IP
+            }
+            else
+            {
+                Console.WriteLine($"{ttl,3}   {time1,5}   {time2,5}   {time3,5}   {hostName} [{hopIP}]");  // Выводим имя + IP
+            }
+        }
+    }
+
+    static string ResolveHostName(IPAddress ip)
+    {
+        try
+        {
+            return Dns.GetHostEntry(ip).HostName;  // Получаем имя хоста
+        }
+        catch
+        {
+            return ip.ToString();  // Если не получилось, возвращаем просто IP
+        }
+    }
+
+    static byte[] GenerateIcmpPacket(ushort sequenceNumber)
+    {
+        byte[] data = new byte[64];  // 64 байта данных (как в системном tracert)
+        Array.Clear(data, 0, data.Length); // Заполняем нулями
+
+        byte[] packet = new byte[8 + data.Length];  // 8 байт ICMP заголовка + 64 байта данных (итого 72 байта)
+
+        packet[0] = 8; // Тип: Echo Request
+        packet[1] = 0; // Код: 0
+        Array.Copy(BitConverter.GetBytes((ushort)0), 0, packet, 2, 2); // Контрольная сумма (пока 0)
+
+        // Identifier (1 в Big-Endian)
+        ushort identifier = 1;
+        Array.Copy(BitConverter.GetBytes((ushort)((identifier << 8) | (identifier >> 8))), 0, packet, 4, 2);
+
+        // Sequence Number (Big-Endian)
+        ushort sequenceNumberBE = (ushort)((sequenceNumber << 8) | (sequenceNumber >> 8));
+        Array.Copy(BitConverter.GetBytes(sequenceNumberBE), 0, packet, 6, 2);
+
+        // Копируем данные (64 байта) в начало полезной нагрузки (байт 8)
+        Array.Copy(data, 0, packet, 8, data.Length);
+
+        // Вычисляем контрольную сумму и записываем
+        ushort checksum = CalculateChecksum(packet);
+        Array.Copy(BitConverter.GetBytes(checksum), 0, packet, 2, 2);
+
+        return packet;
+    }
+
+    static ushort CalculateChecksum(byte[] data)
+    {
+        int sum = 0;
+        for (int i = 0; i < data.Length; i += 2)
+        {
+            sum += BitConverter.ToUInt16(data, i);  // Складываем пары байтов
+        }
+        while ((sum >> 16) != 0)
+        {  // Складываем верхние и нижние 16 бит
+            sum = (sum & 0xFFFF) + (sum >> 16);
+        }
+        return (ushort)~sum;  // Инвертируем результат
+    }
+}
